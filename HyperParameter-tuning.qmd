@@ -1,0 +1,191 @@
+---
+project:
+  title: "Hyperparameter-tuning"
+  output_dir: docs
+  type: website
+format: 
+  html:
+    self-contained: true
+execute:
+  echo: true
+editor: visual
+---
+
+## Set up 
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(powerjoin)
+library(glue)
+library(vip)
+library(baguette)
+library(ggplot2)
+library(ggpubr)
+library(parsnip)
+library(visdat)
+library(glmnet)
+library(patchwork)
+```
+
+
+```{r}
+root <-'https://gdex.ucar.edu/dataset/camels/file'
+download.file('https://gdex.ucar.edu/dataset/camels/file/camels_attributes_v2.0.pdf',
+              'data/camels_attributes_v2.0.pdf')
+types <- c("clim", "geol", "soil", "topo", "vege", "hydro")
+remote_files  <- glue('{root}/camels_{types}.txt')
+local_files   <- glue('data/camels_{types}.txt')
+walk2(remote_files, local_files, download.file, quiet = TRUE)
+camels <- map(local_files, read_delim, show_col_types = FALSE)
+camels <- power_full_join(camels ,by = 'gauge_id')
+```
+
+## Cleaning 
+
+```{r}
+camels_cleaned <- camels |>
+select( p_mean,aridity, gauge_lat, gauge_lon,runoff_ratio,gauge_id,q_mean) |>
+    mutate(LogMean = log(q_mean))|>
+  mutate(LogAridity = log(aridity))|>
+  mutate(LogP_mean = log(p_mean))|>
+  mutate(LogRunoff = log(runoff_ratio))
+
+
+#distribution evaluation with shapiro test
+shapiro.test(camels$q_mean)
+shapiro.test(camels_cleaned$aridity)
+shapiro.test(camels_cleaned$p_mean)
+shapiro.test(camels_cleaned$runoff_ratio)
+#all of our predictors are skewed so we can apply log to them all to see what this fixes
+shapiro.test(camels_cleaned$LogAridity)
+shapiro.test(camels_cleaned$LogP_mean)
+shapiro.test(camels_cleaned$LogMean)
+shapiro.test(camels_cleaned$LogRunoff)
+ggscatter(camels_cleaned, x = "runoff_ratio", y = "LogMean")
+ggscatter(camels_cleaned, x = "p_mean", y = "LogMean")
+ggscatter(camels_cleaned, x = "aridity", y = "LogMean")
+# p_mean and runoff_ratio have a strong log relationship applying a log function over the recipe with these predictors should provide very strong correlation outliers of aritidy will be removed to provide a stronger relationship 
+  
+camels_cleaned <- camels_cleaned |>
+  na.omit()
+  
+#Our cleaning boosted our correlation valuesa a good amount, so now we should be able to make a good recipe and models 
+
+```
+
+## Recipe & Model Making 
+
+```{r}
+set.seed(1003)
+camels_split <- initial_split(camels_cleaned, prop = 0.8)
+camels_training <- training(camels_split)
+camels_test <- testing(camels_split)
+fold<- vfold_cv(camels_training, v = 10)
+#equation testing 
+lm_model <- lm(LogMean ~ runoff_ratio, p_mean, aridity, data = camels_cleaned)
+summary(lm_model)
+#r squared of 0.89 is very good to base a recipe off of. 
+camel_rec <- recipe(LogMean ~ runoff_ratio, p_mean, aridity, data = camels_training) |>
+  step_log(all_predictors())
+# Because this recipe only contains continous data, I will be using regression based models, my models will be a linear model, randforest, and boosted trees
+boost_model = boost_tree()|>
+  set_engine("xgboost") |>
+  set_mode("regression")
+rand_model = rand_forest()|>
+  set_engine("ranger") |>
+  set_mode("regression")
+linear_model <- linear_reg()|>
+  set_engine("lm") |>
+  set_mode("regression")
+boost_wf = workflow() |>
+  add_recipe(camel_rec) |>
+  add_model(boost_model) |>
+  fit(data = camels_training)
+rand_wf = workflow() |>
+  add_recipe(camel_rec) |>
+  add_model(rand_model) |>
+  fit(data = camels_training)
+linear_wf = workflow() |>
+  add_recipe(camel_rec) |>
+  add_model (linear_model) |>
+  fit(data = camels_training)
+flow <- workflow_set(list(camel_rec), list(rand_model,linear_model, boost_model)) |>
+  workflow_map('fit_resamples', resamples = fold)
+autoplot(flow)
+```
+
+From our graph, our linear model is the clear winner. with the highest r squared value and lowest root mean squared error. I believe this is because of the similarity between our recipe and the engine we used for this model, because we used what was essentially a linear regression, and set our engine as lm. They were basically the same so we got the best results, this is reinforced becuase when we ran a lm it gave us a very high r squared value so this r squared value carried over well to the lm engine. However, for some reason there aren't tuning parameters for linear regression. So were gonna use boost tree
+
+## Tuning the Model 
+
+```{r}
+boost_model_tune <- boost_tree(trees = tune(), learn_rate = tune())  %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+
+tune_wf <- workflow(camel_rec, boost_model_tune)
+
+dials <- extract_parameter_set_dials(tune_wf)
+my.grid <- grid_latin_hypercube(dials, size = 20)
+
+model_params <- tune_grid(
+  tune_wf,
+  resamples = fold,
+  grid = my.grid,
+  metrics = metric_set(rmse, rsq, mae),
+  control = control_grid(save_pred = TRUE))
+
+
+autoplot(model_params)
+collect_metrics(model_params)
+show_best(model_params, metric = 'mae')
+# The best mae tells us that the model has the lowest Mae which is important for understanding how much error is in the model or basically how inaccurate the predicted model is in comparison with the acutal data 
+hp_best <- select_best(model_params, metric = 'rsq')
+final_wf <- finalize_workflow(tune_wf, hp_best)
+fit <- last_fit(final_wf, camels_split)
+collect_metrics(fit)
+# the metrics are good with an r squared of almost .95!
+```
+
+## Final Predictions & Map
+
+```{r}
+pred <- collect_predictions(fit)
+
+pred |>
+ggplot(aes(x = .pred, y = LogMean)) +
+  geom_point(aes(color = LogMean)) +
+  scale_color_viridis_c() + 
+  geom_smooth(method = lm) +
+  geom_abline() + 
+  theme_linedraw() + 
+  labs(x = "Predictor Values", y = "Predicted Discharge", title = "Graph Predicting Daily Discharge")
+final_fit <- fit(final_wf, data = camels_cleaned)
+plot_data <- augment(final_fit, new_data = camels_cleaned)
+plot_data <- plot_data|>
+  mutate(residual = ((LogMean - .pred)^2))
+```
+
+## Making Plots
+
+```{r}
+p1 <- plot_data |>
+  ggplot(aes(x = gauge_lon, y = gauge_lat)) + 
+    borders("state", colour = "grey50") + 
+    geom_point(aes(size = .pred, color = LogMean), size = 1.25) +
+    scale_color_gradient(low = "yellow", high = "blue") +
+  labs(x = "Longitude", y = "Latitude")
+
+p2 <- plot_data |>
+  ggplot(aes(x = gauge_lon, y = gauge_lat)) + 
+    borders("state", colour = "grey50") + 
+    geom_point(aes(size = residual, color = residual), size = 1.25) +
+    scale_color_gradient(low = "blue", high = "red")+
+  labs(x = "Longitude", y = "Latitude")
+
+
+p1|p2
+
+```
+
